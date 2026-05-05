@@ -141,7 +141,10 @@ class ConfigWrapper:
 class ConfigFileReader:
     def read_config_file(self, filename):
         try:
-            f = open(filename, 'r')
+            if sys.version_info.major >= 3:
+                f = open(filename, 'r', encoding='utf-8')
+            else:
+                f = open(filename, 'r')
             data = f.read()
             f.close()
         except:

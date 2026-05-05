@@ -259,6 +259,31 @@ def arg_dictionary(option, opt_str, value, parser):
         parser.values.dictionary = {}
     parser.values.dictionary[key] = fname
 
+def parse_tcp_address(value):
+    if value is None or not value.startswith("tcp://"):
+        return None
+    address = value[6:]
+    if not address:
+        raise optparse.OptionValueError("Invalid tcp address '%s'" % (value,))
+    if address.startswith("["):
+        end = address.find("]")
+        if end < 0 or address[end:end+2] != "]:":
+            raise optparse.OptionValueError("Invalid tcp address '%s'" % (
+                value,))
+        host, port = address[1:end], address[end+2:]
+    else:
+        if ":" not in address:
+            raise optparse.OptionValueError("Invalid tcp address '%s'" % (
+                value,))
+        host, port = address.rsplit(":", 1)
+    try:
+        port = int(port)
+    except ValueError:
+        raise optparse.OptionValueError("Invalid tcp port in '%s'" % (value,))
+    if port <= 0 or port > 65535:
+        raise optparse.OptionValueError("Invalid tcp port in '%s'" % (value,))
+    return host, port
+
 def main():
     usage = "%prog [options] <config file>"
     opts = optparse.OptionParser(usage)
@@ -296,7 +321,11 @@ def main():
         debuginput = open(options.debuginput, 'rb')
         start_args['gcode_fd'] = debuginput.fileno()
     else:
-        start_args['gcode_fd'] = util.create_pty(options.inputtty)
+        gcode_tcp = parse_tcp_address(options.inputtty)
+        if gcode_tcp is not None:
+            start_args['gcode_tcp'] = gcode_tcp
+        else:
+            start_args['gcode_fd'] = util.create_pty(options.inputtty)
     if options.debugoutput:
         start_args['debugoutput'] = options.debugoutput
         start_args.update(options.dictionary)

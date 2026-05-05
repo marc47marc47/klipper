@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2025  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, re, logging, collections, shlex, operator
+import os, re, logging, collections, shlex, operator, socket, errno
 
 class CommandError(Exception):
     pass
@@ -393,13 +393,20 @@ class GCodeIO:
         self.gcode = printer.lookup_object('gcode')
         self.gcode_mutex = self.gcode.get_mutex()
         self.fd = printer.get_start_args().get("gcode_fd")
+        self.gcode_tcp = printer.get_start_args().get("gcode_tcp")
         self.reactor = printer.get_reactor()
         self.is_printer_ready = False
         self.is_processing_data = False
         self.is_fileinput = not not printer.get_start_args().get("debuginput")
         self.pipe_is_active = True
         self.fd_handle = None
-        if not self.is_fileinput:
+        self.tcp_sock = self.tcp_handle = None
+        self.tcp_clients = {}
+        self.active_client = None
+        if self.gcode_tcp is not None:
+            self.gcode.register_output_handler(self._respond_raw)
+            self._start_tcp_server()
+        elif not self.is_fileinput:
             self.gcode.register_output_handler(self._respond_raw)
             self.fd_handle = self.reactor.register_fd(self.fd,
                                                       self._process_data)
@@ -410,8 +417,32 @@ class GCodeIO:
         # Register event handlers
         printer.register_event_handler("klippy:ready", self._handle_ready)
         printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
+        printer.register_event_handler("klippy:disconnect",
+                                       self._handle_disconnect)
         printer.register_event_handler("klippy:analyze_shutdown",
                                        self._handle_analyze_shutdown)
+    def _start_tcp_server(self):
+        host, port = self.gcode_tcp
+        self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.tcp_sock.setblocking(0)
+        self.tcp_sock.bind((host, port))
+        self.tcp_sock.listen(5)
+        logging.info("G-code TCP input listening on %s:%d", host, port)
+        self.tcp_handle = self.reactor.register_fd(
+            self.tcp_sock.fileno(), self._handle_tcp_accept)
+    def _handle_tcp_accept(self, eventtime):
+        while 1:
+            try:
+                sock, addr = self.tcp_sock.accept()
+            except socket.error as e:
+                if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    return
+                logging.exception("Accept G-code TCP connection")
+                return
+            sock.setblocking(0)
+            client = GCodeTcpClient(self, sock, addr)
+            self.tcp_clients[client.fd] = client
     def _handle_ready(self):
         self.is_printer_ready = True
         if self.is_fileinput and self.fd_handle is None:
@@ -429,6 +460,18 @@ class GCodeIO:
         self.is_printer_ready = False
         if self.is_fileinput:
             self.printer.request_exit('error_exit')
+    def _handle_disconnect(self):
+        for client in list(self.tcp_clients.values()):
+            client.close()
+        if self.tcp_handle is not None:
+            self.reactor.unregister_fd(self.tcp_handle)
+            self.tcp_handle = None
+        if self.tcp_sock is not None:
+            try:
+                self.tcp_sock.close()
+            except socket.error:
+                pass
+            self.tcp_sock = None
     m112_r = re.compile(r'^(?:[nN][0-9]+)?\s*[mM]112(?:\s|$)')
     def _process_data(self, eventtime):
         # Read input, separate by newline, and add to pending_commands
@@ -475,7 +518,40 @@ class GCodeIO:
         if self.fd_handle is None:
             self.fd_handle = self.reactor.register_fd(self.fd,
                                                       self._process_data)
+    def process_tcp_data(self, client, data, eventtime):
+        self.input_log.append((eventtime, data))
+        self.bytes_read += len(data)
+        lines = data.split('\n')
+        lines[0] = client.partial_input + lines[0]
+        client.partial_input = lines.pop()
+        pending_commands = client.pending_commands
+        pending_commands.extend(lines)
+        if len(pending_commands) < 20:
+            for line in lines:
+                if self.m112_r.match(line) is not None:
+                    self.gcode.cmd_M112(None)
+        if self.is_processing_data:
+            return
+        self.is_processing_data = True
+        old_client = self.active_client
+        self.active_client = client
+        try:
+            while pending_commands:
+                client.pending_commands = []
+                with self.gcode_mutex:
+                    self.gcode._process_commands(pending_commands)
+                pending_commands = client.pending_commands
+        finally:
+            self.active_client = old_client
+            self.is_processing_data = False
     def _respond_raw(self, msg):
+        if self.active_client is not None:
+            self.active_client.send((msg + "\n").encode())
+            return
+        if self.gcode_tcp is not None:
+            for client in list(self.tcp_clients.values()):
+                client.send((msg + "\n").encode())
+            return
         if self.pipe_is_active:
             try:
                 os.write(self.fd, (msg+"\n").encode())
@@ -484,6 +560,73 @@ class GCodeIO:
                 self.pipe_is_active = False
     def stats(self, eventtime):
         return False, "gcodein=%d" % (self.bytes_read,)
+
+class GCodeTcpClient:
+    def __init__(self, gcode_io, sock, addr):
+        self.gcode_io = gcode_io
+        self.reactor = gcode_io.reactor
+        self.sock = sock
+        self.addr = addr
+        self.fd = sock.fileno()
+        self.fd_handle = self.reactor.register_fd(
+            self.fd, self.process_received, self._do_send)
+        self.partial_input = ""
+        self.pending_commands = []
+        self.send_buffer = b""
+        self.is_blocking = False
+        logging.info("G-code TCP client connected: %s", addr)
+    def close(self):
+        if self.fd_handle is None:
+            return
+        logging.info("G-code TCP client disconnected: %s", self.addr)
+        self.reactor.unregister_fd(self.fd_handle)
+        self.fd_handle = None
+        self.gcode_io.tcp_clients.pop(self.fd, None)
+        try:
+            self.sock.close()
+        except socket.error:
+            pass
+    def process_received(self, eventtime):
+        try:
+            data = self.sock.recv(4096)
+        except socket.error as e:
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return
+            self.close()
+            return
+        if not data:
+            self.close()
+            return
+        try:
+            data = str(data.decode())
+        except UnicodeDecodeError:
+            logging.exception("Read G-code TCP data")
+            return
+        self.gcode_io.process_tcp_data(self, data, eventtime)
+    def send(self, data):
+        if self.fd_handle is None:
+            return
+        self.send_buffer += data
+        if not self.is_blocking:
+            self._do_send()
+    def _do_send(self, eventtime=None):
+        if self.fd_handle is None or not self.send_buffer:
+            return
+        try:
+            sent = self.sock.send(self.send_buffer)
+        except socket.error as e:
+            if e.errno not in (errno.EAGAIN, errno.EWOULDBLOCK):
+                self.close()
+                return
+            sent = 0
+        self.send_buffer = self.send_buffer[sent:]
+        if self.send_buffer:
+            if not self.is_blocking:
+                self.reactor.set_fd_wake(self.fd_handle, False, True)
+                self.is_blocking = True
+        elif self.is_blocking:
+            self.reactor.set_fd_wake(self.fd_handle, True, False)
+            self.is_blocking = False
 
 def add_early_printer_objects(printer):
     printer.add_object('gcode', GCodeDispatch(printer))

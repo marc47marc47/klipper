@@ -126,11 +126,19 @@ class ServerSocket:
         if not server_address or is_fileinput:
             # Do not enable server
             return
-        self._remove_socket_file(server_address)
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        tcp_address = self._parse_tcp_address(server_address)
+        if tcp_address is None:
+            self._remove_socket_file(server_address)
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            bind_address = server_address
+        else:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            bind_address = tcp_address
         self.sock.setblocking(0)
-        self.sock.bind(server_address)
+        self.sock.bind(bind_address)
         self.sock.listen(1)
+        logging.info("webhooks listening on %s", server_address)
         self.fd_handle = self.reactor.register_fd(
             self.sock.fileno(), self._handle_accept)
         printer.register_event_handler(
@@ -160,6 +168,20 @@ class ServerSocket:
     def _handle_analyze_shutdown(self, msg, details):
         for client in self.clients.values():
             client.dump_request_log()
+
+    def _parse_tcp_address(self, server_address):
+        if not server_address.startswith("tcp://"):
+            return None
+        address = server_address[6:]
+        if address.startswith("["):
+            end = address.find("]")
+            if end < 0 or address[end:end+2] != "]:":
+                raise WebRequestError("Invalid tcp address '%s'" % (
+                    server_address,))
+            host, port = address[1:end], address[end+2:]
+        else:
+            host, port = address.rsplit(":", 1)
+        return host, int(port)
 
     def _remove_socket_file(self, file_path):
         try:
@@ -372,8 +394,8 @@ class WebHooks:
                     'klipper_path': klipper_path,
                     'python_path': sys.executable,
                     'process_id': os.getpid(),
-                    'user_id': os.getuid(),
-                    'group_id': os.getgid()}
+                    'user_id': getattr(os, 'getuid', lambda: None)(),
+                    'group_id': getattr(os, 'getgid', lambda: None)()}
         start_args = self.printer.get_start_args()
         for sa in ['log_file', 'config_file', 'software_version', 'cpu_info']:
             response[sa] = start_args.get(sa)

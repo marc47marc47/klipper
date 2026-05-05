@@ -1,0 +1,5 @@
+; Windows DLL export overrides for c_helper.so when built with MinGW-w64.
+; Renames chelper_free to "free" so existing cffi callers (ffi_lib.free)
+; keep working without changing every call site.
+EXPORTS
+    free = chelper_free

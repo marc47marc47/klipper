@@ -1,6 +1,18 @@
 out
+out-orig/
+.uv/
+.venv/
 *.so
 *.pyc
 .config
 .config.old
 klippy/.version
+
+# build / pack byproducts
+dist/
+klippy/chelper/err.log
+klippy/chelper/stdout.log
+klippy/chelper/stderr.log
+
+# transient session notes (kept locally, not committed)
+develop-claude-qa.txt

@@ -12,7 +12,6 @@
 // clock times, prioritizes commands, and handles retransmissions.  A
 // background thread is launched to do this work and minimize latency.
 
-#include <linux/can.h> // // struct can_frame
 #include <math.h> // fabs
 #include <pthread.h> // pthread_mutex_lock
 #include <stddef.h> // offsetof
@@ -20,7 +19,11 @@
 #include <stdio.h> // snprintf
 #include <stdlib.h> // malloc
 #include <string.h> // memset
+#if defined(_WIN32) && !defined(__CYGWIN__)
+// Windows / MSVC does not provide <termios.h>; tcflush() is stubbed below
+#else
 #include <termios.h> // tcflush
+#endif
 #include <unistd.h> // pipe
 #include "compiler.h" // __visible
 #include "list.h" // list_add_tail
@@ -28,6 +31,96 @@
 #include "pollreactor.h" // pollreactor_alloc
 #include "pyhelper.h" // get_monotonic
 #include "serialqueue.h" // struct queue_message
+
+#if defined(_WIN32) && !defined(__CYGWIN__)
+// Windows / MinGW build: replace POSIX pipe / read / write with socket-based
+// equivalents so all fds handed to WSAPoll are real sockets. The transmit
+// wakeup pipe becomes an emulated TCP socketpair, and the serial fd handed
+// down by pyserial's socket:// transport is already a socket.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+
+// termios stubs (Windows MSVC has no <termios.h>; tcflush() is a no-op).
+#define TCOFLUSH 1
+static inline int tcflush(int fd, int q) { (void)fd; (void)q; return 0; }
+
+// One-shot WSAStartup at DLL load time.
+static void __attribute__((constructor)) klipper_wsa_init(void) {
+    WSADATA d;
+    WSAStartup(MAKEWORD(2, 2), &d);
+}
+
+// Emulate POSIX socketpair on Windows by binding a loopback listener,
+// connecting one client and accepting the matching server end.
+static int win_socketpair(int fds[2]) {
+    SOCKET listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET)
+        return -1;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    int yes = 1;
+    setsockopt(listener, SOL_SOCKET, SO_REUSEADDR,
+               (const char *)&yes, sizeof(yes));
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr))
+        == SOCKET_ERROR) {
+        closesocket(listener);
+        return -1;
+    }
+    int alen = sizeof(addr);
+    if (getsockname(listener, (struct sockaddr *)&addr, &alen)
+        == SOCKET_ERROR) {
+        closesocket(listener);
+        return -1;
+    }
+    if (listen(listener, 1) == SOCKET_ERROR) {
+        closesocket(listener);
+        return -1;
+    }
+    SOCKET client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (client == INVALID_SOCKET) {
+        closesocket(listener);
+        return -1;
+    }
+    if (connect(client, (struct sockaddr *)&addr, sizeof(addr))
+        == SOCKET_ERROR) {
+        closesocket(listener);
+        closesocket(client);
+        return -1;
+    }
+    SOCKET server = accept(listener, NULL, NULL);
+    closesocket(listener);
+    if (server == INVALID_SOCKET) {
+        closesocket(client);
+        return -1;
+    }
+    fds[0] = (int)server;  // read end
+    fds[1] = (int)client;  // write end
+    return 0;
+}
+
+#define pipe(fds) win_socketpair(fds)
+
+// Route POSIX-style read/write/close at the call sites in this file through
+// Winsock so they work on socket fds (POSIX read/write don't accept SOCKETs
+// on Windows).
+#define read(fd, buf, n)   recv((SOCKET)(fd), (char *)(buf), (int)(n), 0)
+#define write(fd, buf, n)  send((SOCKET)(fd), (const char *)(buf), \
+                                (int)(n), 0)
+#define close(fd)          closesocket((SOCKET)(fd))
+#endif
+
+#ifndef __linux__
+struct can_frame {
+    uint32_t can_id;
+    uint8_t can_dlc;
+    uint8_t data[8];
+};
+#else
+#include <linux/can.h> // // struct can_frame
+#endif
 
 struct message_sub_queue {
     struct list_head msg_queue;
@@ -256,10 +349,21 @@ handle_message(struct serialqueue *sq, double eventtime, int len)
     uint32_t rseq_delta = ((sq->input_buf[MESSAGE_POS_SEQ] - sq->receive_seq)
                            & MESSAGE_SEQ_MASK);
     uint64_t rseq = sq->receive_seq + rseq_delta;
+#ifdef KLIPPER_TRACE_IO
+    errorf("trace handle_message rseq=%llu receive_seq=%llu send_seq=%llu"
+           " seq_byte=0x%02x notify_q_empty=%d",
+           (unsigned long long)rseq, (unsigned long long)sq->receive_seq,
+           (unsigned long long)sq->send_seq,
+           sq->input_buf[MESSAGE_POS_SEQ],
+           list_empty(&sq->notify_queue));
+#endif
     if (rseq != sq->receive_seq) {
         // New sequence number
         if (rseq > sq->send_seq && sq->receive_seq != 1) {
             // An ack for a message not sent?  Out of order message?
+#ifdef KLIPPER_TRACE_IO
+            errorf("trace handle_message DROPPED (out of order)");
+#endif
             sq->bytes_invalid += len;
             pthread_mutex_unlock(&sq->lock);
             return;
@@ -303,6 +407,10 @@ handle_message(struct serialqueue *sq, double eventtime, int len)
         list_add_tail(&qm->node, &received);
     }
 
+#ifdef KLIPPER_TRACE_IO
+    errorf("trace handle_message received_q_empty=%d",
+           list_empty(&received));
+#endif
     if (!list_empty(&received))
         receive_append_wake(&sq->receiver, &received);
 
@@ -323,6 +431,30 @@ handle_message(struct serialqueue *sq, double eventtime, int len)
     pthread_mutex_unlock(&sq->lock);
 }
 
+#ifdef KLIPPER_TRACE_IO
+// Log first/last bytes of a buffer in hex. Compiled in only when chelper is
+// built with -DKLIPPER_TRACE_IO (set KLIPPER_TRACE_IO=1 in the environment
+// before launching klippy to recompile c_helper.so with these traces).
+static void
+trace_dump(const char *tag, const uint8_t *buf, int len)
+{
+    char out[512];
+    int n = 0, i;
+    int head = len > 24 ? 24 : len;
+    for (i = 0; i < head && n < (int)sizeof(out) - 8; i++)
+        n += snprintf(out + n, sizeof(out) - n, "%02x", buf[i]);
+    if (len > head + 8) {
+        n += snprintf(out + n, sizeof(out) - n, "..");
+        for (i = len - 8; i < len && n < (int)sizeof(out) - 4; i++)
+            n += snprintf(out + n, sizeof(out) - n, "%02x", buf[i]);
+    } else if (len > head) {
+        for (i = head; i < len && n < (int)sizeof(out) - 4; i++)
+            n += snprintf(out + n, sizeof(out) - n, "%02x", buf[i]);
+    }
+    errorf("trace %s len=%d %s", tag, len, out);
+}
+#endif
+
 // Callback for input activity on the serial fd
 static void
 input_event(struct serialqueue *sq, double eventtime)
@@ -342,6 +474,13 @@ input_event(struct serialqueue *sq, double eventtime)
     } else {
         int ret = read(sq->serial_fd, &sq->input_buf[sq->input_pos]
                        , sizeof(sq->input_buf) - sq->input_pos);
+#ifdef KLIPPER_TRACE_IO
+        if (sq->bytes_read < 256)
+            trace_dump("recv", &sq->input_buf[sq->input_pos],
+                       ret > 0 ? ret : 0);
+        if (ret <= 0)
+            errorf("trace recv ret=%d (would exit reactor)", ret);
+#endif
         if (ret <= 0) {
             if(ret < 0)
                 report_errno("read", ret);
@@ -354,11 +493,18 @@ input_event(struct serialqueue *sq, double eventtime)
     }
     for (;;) {
         int len = msgblock_check(&sq->need_sync, sq->input_buf, sq->input_pos);
+#ifdef KLIPPER_TRACE_IO
+        errorf("trace msgblock_check ret=%d input_pos=%d need_sync=%d",
+               len, sq->input_pos, sq->need_sync);
+#endif
         if (!len)
             // Need more data
             return;
         if (len > 0) {
             // Received a valid message
+#ifdef KLIPPER_TRACE_IO
+            errorf("trace handle_message len=%d", len);
+#endif
             handle_message(sq, eventtime, len);
         } else {
             // Skip bad data at beginning of input
@@ -390,6 +536,12 @@ do_write(struct serialqueue *sq, void *buf, int buflen)
 {
     if (sq->serial_fd_type != SQT_CAN) {
         int ret = write(sq->serial_fd, buf, buflen);
+#ifdef KLIPPER_TRACE_IO
+        if (sq->bytes_write < 512) {
+            trace_dump("send", buf, buflen);
+            errorf("trace send ret=%d buflen=%d", ret, buflen);
+        }
+#endif
         if (ret < 0)
             report_errno("write", ret);
         return;
@@ -972,6 +1124,10 @@ serialqueue_pull(struct serialqueue *sq, struct pull_queue_message *pqm)
     pqm->sent_time = qm->sent_time;
     pqm->receive_time = qm->receive_time;
     pqm->notify_id = qm->notify_id;
+#ifdef KLIPPER_TRACE_IO
+    errorf("trace serialqueue_pull len=%d notify_id=%llu",
+           qm->len, (unsigned long long)qm->notify_id);
+#endif
     if (qm->len)
         qm = _debug_queue_add(&receiver->old_receive, qm);
     pthread_mutex_unlock(&receiver->lock);

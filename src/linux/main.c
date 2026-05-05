@@ -32,12 +32,17 @@ realtime_setup(void)
         report_errno("sched_setscheduler", ret);
         return -1;
     }
+#if defined(MCL_CURRENT) && defined(MCL_FUTURE)
     // Lock ourselves into memory
     ret = mlockall(MCL_CURRENT | MCL_FUTURE);
     if (ret) {
         report_errno("mlockall", ret);
         return -1;
     }
+#else
+    fprintf(stderr, "mlockall not supported on this platform\n");
+    return -1;
+#endif
     return 0;
 }
 

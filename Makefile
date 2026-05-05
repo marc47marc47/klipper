@@ -30,7 +30,7 @@ cc-option=$(shell if test -z "`$(1) $(2) -S -o /dev/null -xc /dev/null 2>&1`" \
     ; then echo "$(2)"; else echo "$(3)"; fi ;)
 
 CFLAGS := -iquote $(OUT) -iquote src -iquote $(OUT)board-generic/ \
-		-std=gnu11 -O2 -MD -Wall \
+		-std=gnu11 -O2 -MMD -Wall \
 		-Wold-style-definition $(call cc-option,$(CC),-Wtype-limits,) \
     -ffunction-sections -fdata-sections -fno-delete-null-pointer-checks
 CFLAGS += -flto=auto -fwhole-program -fno-use-linker-plugin -ggdb3
@@ -39,7 +39,7 @@ OBJS_klipper.elf = $(patsubst %.c, $(OUT)src/%.o,$(src-y))
 OBJS_klipper.elf += $(OUT)compile_time_request.o
 CFLAGS_klipper.elf = $(CFLAGS) -Wl,--gc-sections
 
-CPPFLAGS = -I$(OUT) -P -MD -MT $@
+CPPFLAGS = -I$(OUT) -P -MMD -MT $@
 
 # Default targets
 target-y := $(OUT)klipper.elf
@@ -90,10 +90,10 @@ create-board-link:
 	@echo "  Creating symbolic link $(OUT)board"
 	$(Q)mkdir -p $(addprefix $(OUT), $(dirs-y))
 	$(Q)rm -f $(OUT)*.d $(patsubst %,$(OUT)%/*.d,$(dirs-y))
-	$(Q)rm -f $(OUT)board
+	$(Q)rm -rf $(OUT)board
 	$(Q)ln -sf $(CURDIR)/src/$(CONFIG_BOARD_DIRECTORY) $(OUT)board
 	$(Q)mkdir -p $(OUT)board-generic
-	$(Q)rm -f $(OUT)board-generic/board
+	$(Q)rm -rf $(OUT)board-generic/board
 	$(Q)ln -sf $(CURDIR)/src/generic $(OUT)board-generic/board
 
 # Hack to rebuild OUT directory and reload make dependencies on Kconfig change

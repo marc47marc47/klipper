@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2021  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, logging
+import os, logging, shutil
 import cffi
 
 
@@ -11,10 +11,49 @@ import cffi
 # c_helper.so compiling
 ######################################################################
 
-GCC_CMD = "gcc"
-COMPILE_ARGS = ("-Wall -g -O2 -shared -fPIC"
-                " -flto -fwhole-program -fno-use-linker-plugin"
-                " -o %s %s")
+def _select_gcc():
+    # Allow override via environment for testing / packaging.
+    override = os.environ.get('KLIPPY_GCC')
+    if override:
+        return override
+    if os.name != 'nt':
+        return "gcc"
+    # On Windows, prefer a real MinGW-w64 toolchain. The MSYS2 "/usr/bin/gcc"
+    # links against msys-2.0.dll, and a DLL built with it segfaults when loaded
+    # by a native CPython interpreter.
+    candidates = [
+        "x86_64-w64-mingw32-gcc.exe",
+        "i686-w64-mingw32-gcc.exe",
+        r"C:\msys64\mingw64\bin\gcc.exe",
+        r"C:\msys64\ucrt64\bin\gcc.exe",
+        r"C:\git-sdk-64\mingw64\bin\gcc.exe",
+        r"C:\Program Files\Git\mingw64\bin\gcc.exe",
+    ]
+    for cand in candidates:
+        path = shutil.which(cand) if os.sep not in cand else (
+            cand if os.path.exists(cand) else None)
+        if path:
+            return path
+    return "gcc"
+
+GCC_CMD = _select_gcc()
+if os.name == 'nt':
+    # Windows / MinGW-w64: -fwhole-program strips libc symbols (incl. free)
+    # from the .so export table, breaking cffi's lookup. Keep all symbols and
+    # link ws2_32 (for WSAPoll). chelper_win.def renames chelper_free to
+    # "free" in the export table so ffi_lib.free works. -l flags must follow
+    # source files for ld.
+    _DEF_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                             'chelper_win.def').replace('\\', '/')
+    _TRACE = " -DKLIPPER_TRACE_IO" if os.environ.get('KLIPPER_TRACE_IO') else ""
+    COMPILE_ARGS = ("-Wall -g -O2 -shared -fPIC"
+                    " -flto -fno-use-linker-plugin"
+                    " -Wl,--export-all-symbols"
+                    "%s -o %%s %%s %s -lws2_32" % (_TRACE, _DEF_FILE))
+else:
+    COMPILE_ARGS = ("-Wall -g -O2 -shared -fPIC"
+                    " -flto -fwhole-program -fno-use-linker-plugin"
+                    " -o %s %s")
 SSE_FLAGS = "-mfpmath=sse -msse2"
 SOURCE_FILES = [
     'pyhelper.c', 'serialqueue.c', 'stepcompress.c', 'steppersync.c',
@@ -227,8 +266,11 @@ defs_pyhelper = """
     void set_python_logging_callback(void (*func)(const char *));
     double get_monotonic(void);
     int set_thread_name(char name[16]);
+    void chelper_free(void *ptr);
 """
 
+# Use the chelper-supplied free() wrapper so cffi can locate it on Windows
+# (PE32+ DLLs do not re-export the libc free symbol).
 defs_std = """
     void free(void*);
 """
@@ -244,7 +286,8 @@ defs_all = [
 
 # Update filenames to an absolute path
 def get_abs_files(srcdir, filelist):
-    return [os.path.join(srcdir, fname) for fname in filelist]
+    return [os.path.join(srcdir, fname).replace('\\', '/')
+            for fname in filelist]
 
 # Return the list of file modification times
 def get_mtimes(filelist):
@@ -263,19 +306,45 @@ def check_build_code(sources, target):
     obj_times = get_mtimes([target])
     return not obj_times or max(src_times) > min(obj_times)
 
-# Check if the current gcc version supports a particular command-line option
-def check_gcc_option(option):
-    cmd = "%s %s -S -o /dev/null -xc /dev/null > /dev/null 2>&1" % (
-        GCC_CMD, option)
-    res = os.system(cmd)
-    return res == 0
+def _build_env():
+    # On Windows ensure the gcc toolchain's bin directory is on PATH so cc1
+    # / collect2 can locate sibling DLLs (libisl, libmpc, libmpfr, ...). When
+    # invoked from a non-MSYS shell these are otherwise not resolvable.
+    if os.name != 'nt':
+        return None
+    gcc_path = shutil.which(GCC_CMD)
+    if not gcc_path:
+        return None
+    env = os.environ.copy()
+    bindir = os.path.dirname(gcc_path)
+    env['PATH'] = bindir + os.pathsep + env.get('PATH', '')
+    return env
 
 # Check if the current gcc version supports a particular command-line option
+def check_gcc_option(option):
+    import subprocess
+    null_dev = 'NUL' if os.name == 'nt' else '/dev/null'
+    cmd = '%s %s -S -o %s -xc %s' % (GCC_CMD, option, null_dev, null_dev)
+    try:
+        res = subprocess.call(cmd, shell=True, env=_build_env(),
+                              stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+    except OSError:
+        return False
+    return res == 0
+
+# Run a build command, raising on failure
 def do_build_code(cmd):
-    res = os.system(cmd)
-    if res:
-        msg = "Unable to build C code module (error=%s)" % (res,)
+    import subprocess
+    res = subprocess.run(cmd, shell=True, env=_build_env(),
+                         capture_output=True, text=True)
+    if res.returncode:
+        msg = "Unable to build C code module (error=%s)" % (res.returncode,)
         logging.error(msg)
+        if res.stderr:
+            logging.error("gcc stderr:\n%s", res.stderr)
+        if res.stdout:
+            logging.error("gcc stdout:\n%s", res.stdout)
         raise Exception(msg)
 
 # Build the main c_helper.so c code library
@@ -292,17 +361,37 @@ def check_build_c_library():
         cmd = "%s %s %s" % (GCC_CMD, SSE_FLAGS, COMPILE_ARGS)
     else:
         cmd = "%s %s" % (GCC_CMD, COMPILE_ARGS)
+    cmd = "%s -I%s" % (cmd, srcdir.replace('\\', '/'))
     # Invoke compiler
     logging.info("Building C code module %s", DEST_LIB)
     tempdestlib = get_abs_files(srcdir, ["_temp_" + DEST_LIB])[0]
     do_build_code(cmd % (tempdestlib, ' '.join(srcfiles)))
     # Rename from temporary file to final file name
-    os.rename(tempdestlib, destlib)
+    try:
+        os.replace(tempdestlib, destlib)
+    except AttributeError:
+        os.rename(tempdestlib, destlib)
     return destlib
 
 FFI_main = None
 FFI_lib = None
 pyhelper_logging_callback = None
+dll_directory_cookie = None
+
+def add_build_dll_directory():
+    global dll_directory_cookie
+    if dll_directory_cookie is not None:
+        return
+    add_dll_directory = getattr(os, 'add_dll_directory', None)
+    if add_dll_directory is None:
+        return
+    gcc_path = shutil.which(GCC_CMD)
+    if gcc_path is None:
+        return
+    try:
+        dll_directory_cookie = add_dll_directory(os.path.dirname(gcc_path))
+    except OSError:
+        logging.debug("Unable to add gcc DLL directory", exc_info=True)
 
 # Helper invoked from C errorf() code to log errors
 def logging_callback(msg):
@@ -314,6 +403,7 @@ def get_ffi():
     if FFI_lib is None:
         # Check if library needs to be built, and build if so
         destlib = check_build_c_library()
+        add_build_dll_directory()
         # Open library
         FFI_main = cffi.FFI()
         for d in defs_all:

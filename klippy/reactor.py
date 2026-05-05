@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2026  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, gc, select, math, time, logging, queue
+import os, gc, select, math, time, logging, queue, socket
 import greenlet
 import chelper, util
 
@@ -116,6 +116,7 @@ class SelectReactor:
         self._next_timer = self.NEVER
         # Callbacks
         self._pipe_fds = None
+        self._pipe_sockets = None
         self._async_queue = queue.Queue()
         # File descriptors
         self._dummy_fd_hdl = ReactorFileHandler(-1, (lambda e: None),
@@ -200,19 +201,27 @@ class SelectReactor:
         self._async_queue.put_nowait(
             (ReactorCallback, (self, callback, waketime)))
         try:
-            os.write(self._pipe_fds[1], b'.')
-        except os.error:
+            self._send_async_signal()
+        except (os.error, socket.error):
             pass
     def async_complete(self, completion, result):
         self._async_queue.put_nowait((completion.complete, (result,)))
         try:
-            os.write(self._pipe_fds[1], b'.')
-        except os.error:
+            self._send_async_signal()
+        except (os.error, socket.error):
             pass
+    def _send_async_signal(self):
+        if self._pipe_sockets is not None:
+            self._pipe_sockets[1].send(b'.')
+        else:
+            os.write(self._pipe_fds[1], b'.')
     def _got_pipe_signal(self, eventtime):
         try:
-            os.read(self._pipe_fds[0], 4096)
-        except os.error:
+            if self._pipe_sockets is not None:
+                self._pipe_sockets[0].recv(4096)
+            else:
+                os.read(self._pipe_fds[0], 4096)
+        except (os.error, socket.error):
             pass
         while 1:
             try:
@@ -221,9 +230,16 @@ class SelectReactor:
                 break
             func(*args)
     def _setup_async_callbacks(self):
-        self._pipe_fds = os.pipe()
-        util.set_nonblock(self._pipe_fds[0])
-        util.set_nonblock(self._pipe_fds[1])
+        if os.name == 'nt':
+            self._pipe_sockets = socket.socketpair()
+            self._pipe_sockets[0].setblocking(0)
+            self._pipe_sockets[1].setblocking(0)
+            self._pipe_fds = (self._pipe_sockets[0].fileno(),
+                              self._pipe_sockets[1].fileno())
+        else:
+            self._pipe_fds = os.pipe()
+            util.set_nonblock(self._pipe_fds[0])
+            util.set_nonblock(self._pipe_fds[1])
         self.register_fd(self._pipe_fds[0], self._got_pipe_signal)
     # Greenlets
     def _sys_pause(self, waketime):
@@ -353,8 +369,13 @@ class SelectReactor:
                 logging.exception("reactor finalize greenlet terminate")
         self._all_greenlets = []
         if self._pipe_fds is not None:
-            os.close(self._pipe_fds[0])
-            os.close(self._pipe_fds[1])
+            if self._pipe_sockets is not None:
+                self._pipe_sockets[0].close()
+                self._pipe_sockets[1].close()
+                self._pipe_sockets = None
+            else:
+                os.close(self._pipe_fds[0])
+                os.close(self._pipe_fds[1])
             self._pipe_fds = None
 
 class PollReactor(SelectReactor):

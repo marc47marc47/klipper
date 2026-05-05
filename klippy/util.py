@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2020  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import sys, os, pty, fcntl, termios, signal, logging, json, time
+import sys, os, signal, logging, json, time, platform
 import subprocess, traceback, shlex
 
 
@@ -18,11 +18,39 @@ fix_sigint()
 
 # Set a file-descriptor as non-blocking
 def set_nonblock(fd):
-    fcntl.fcntl(fd, fcntl.F_SETFL
-                , fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
+    try:
+        import fcntl
+    except ImportError:
+        # Windows path. os.set_blocking() exists only on Python >= 3.12 there;
+        # for sockets fall back to wrapping the fd with the socket module.
+        # Pipe/tty fds are unsupported -- callers must use socketpair() instead.
+        set_blocking = getattr(os, 'set_blocking', None)
+        if set_blocking is not None:
+            try:
+                set_blocking(fd, False)
+                return
+            except OSError:
+                pass
+        import socket
+        try:
+            sock = socket.socket(fileno=fd)
+        except OSError:
+            raise RuntimeError(
+                "set_nonblock not supported for fd %d on this platform" % (
+                    fd,))
+        sock.setblocking(False)
+        sock.detach()
+        return
+    fcntl.fcntl(fd, fcntl.F_SETFL,
+                fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
 
 # Clear HUPCL flag
 def clear_hupcl(fd):
+    try:
+        import termios
+    except ImportError:
+        logging.info("Unable to clear HUPCL - termios not available")
+        return
     attrs = termios.tcgetattr(fd)
     attrs[2] = attrs[2] & ~termios.HUPCL
     try:
@@ -32,6 +60,12 @@ def clear_hupcl(fd):
 
 # Support for creating a pseudo-tty for emulating a serial port
 def create_pty(ptyname):
+    try:
+        import pty, termios
+    except ImportError:
+        raise RuntimeError(
+            "Pseudo-tty input is not supported on this platform; "
+            "use -I tcp://127.0.0.1:7126 instead")
     mfd, sfd = pty.openpty()
     try:
         os.unlink(ptyname)
@@ -116,7 +150,8 @@ setup_python2_wrappers()
 def get_cpu_info():
     data = _try_read_file('/proc/cpuinfo', maxsize=1024*1024)
     if data is None:
-        return "?"
+        processor = platform.processor() or platform.machine() or "?"
+        return "%d core %s" % (os.cpu_count() or 0, processor)
     lines = [l.split(':', 1) for l in data.split('\n')]
     lines = [(l[0].strip(), l[1].strip()) for l in lines if len(l) == 2]
     core_count = [k for k, v in lines].count("processor")
@@ -128,13 +163,13 @@ def get_device_info():
     if data is None:
         data = _try_read_file("/sys/class/dmi/id/product_name")
         if data is None:
-            return "?"
+            return platform.platform()
     return data.rstrip(' \0').strip()
 
 def get_linux_version():
     data = _try_read_file('/proc/version')
     if data is None:
-        return "?"
+        return platform.platform()
     return data.strip()
 
 def get_version_from_file(klippy_src):

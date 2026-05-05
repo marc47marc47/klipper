@@ -1,0 +1,22 @@
+# Source this file from the repository root:
+#   . scripts/setenv.python
+
+KLIPPER_ROOT="${KLIPPER_ROOT:-$(pwd)}"
+
+export UV_PYTHON_INSTALL_DIR="$KLIPPER_ROOT/.uv/python"
+export VIRTUAL_ENV="$KLIPPER_ROOT/.venv"
+
+if [ -d "$VIRTUAL_ENV/Scripts" ]; then
+    export PATH="$VIRTUAL_ENV/Scripts:$KLIPPER_ROOT/.uv/bin:$PATH"
+    export PYTHON="$VIRTUAL_ENV/Scripts/python.exe"
+else
+    export PATH="$VIRTUAL_ENV/bin:$KLIPPER_ROOT/.uv/bin:$PATH"
+    export PYTHON="$VIRTUAL_ENV/bin/python"
+fi
+
+if [ -x "$PYTHON" ]; then
+    "$PYTHON" --version
+else
+    echo "warning: Python was not found at $PYTHON" >&2
+    echo "run: sh ./install-project-python.sh" >&2
+fi

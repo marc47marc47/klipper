@@ -8,16 +8,32 @@
 #include <stdarg.h> // va_start
 #include <stdint.h> // uint8_t
 #include <stdio.h> // fprintf
+#include <stdlib.h> // free
 #include <string.h> // strerror
 #include <time.h> // struct timespec
+#if defined(_WIN32) || defined(__CYGWIN__)
+#include <windows.h> // QueryPerformanceCounter
+#endif
+#ifdef __linux__
 #include <sys/prctl.h>  // prctl
+#endif
 #include "compiler.h" // __visible
 #include "pyhelper.h" // get_monotonic
+
+#ifndef CLOCK_MONOTONIC_RAW
+#define CLOCK_MONOTONIC_RAW CLOCK_MONOTONIC
+#endif
 
 // Return the monotonic system time as a double
 double __visible
 get_monotonic(void)
 {
+#if defined(_WIN32) || defined(__CYGWIN__)
+    LARGE_INTEGER counter, frequency;
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
     struct timespec ts;
     int ret = clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     if (ret) {
@@ -25,6 +41,7 @@ get_monotonic(void)
         return 0.;
     }
     return (double)ts.tv_sec + (double)ts.tv_nsec * .000000001;
+#endif
 }
 
 // Fill a 'struct timespec' with a system time stored in a double
@@ -98,5 +115,20 @@ dump_string(char *outbuf, int outbuf_size, char *inbuf, int inbuf_size)
 int __visible
 set_thread_name(char name[16])
 {
+#ifdef __linux__
     return prctl(PR_SET_NAME, name);
+#else
+    return 0;
+#endif
+}
+
+// Re-export free() so cffi can locate it on platforms where the underlying
+// libc free is not exported from the loaded shared object (e.g. MinGW PE32+).
+// On Windows the build also passes a .def file (see chelper_win.def) which
+// renames this entry point to "free" in the DLL export table so existing
+// callers using ffi_lib.free keep working.
+void __visible
+chelper_free(void *ptr)
+{
+    free(ptr);
 }

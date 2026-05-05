@@ -6,7 +6,25 @@
 
 #include <fcntl.h> // fcntl
 #include <math.h> // ceil
+#include <stdio.h> // snprintf
+#if defined(_WIN32) && !defined(__CYGWIN__)
+// MinGW-w64: WinSock-based poll & non-blocking helpers. Every fd handed to
+// the chelper poll loop must therefore be a real socket -- serialqueue.c
+// uses an emulated socketpair for its transmit-wakeup channel, and pyserial's
+// socket:// transport already produces socket fds.
+#include <winsock2.h>
+#define poll(fds, nfds, timeout) WSAPoll(fds, nfds, timeout)
+#ifndef POLLHUP
+#define POLLHUP 0x0002
+#endif
+static inline int klipper_set_nonblock(int fd) {
+    u_long nb = 1;
+    return ioctlsocket((SOCKET)fd, FIONBIO, &nb) == SOCKET_ERROR ? -1 : 0;
+}
+#define WIN_FCNTL_NONBLOCK 1
+#else
 #include <poll.h> // poll
+#endif
 #include <stdlib.h> // malloc
 #include <string.h> // memset
 #include "pollreactor.h" // pollreactor_alloc
@@ -68,7 +86,14 @@ pollreactor_add_fd(struct pollreactor *pr, int pos, int fd, void *callback
                    , int write_only)
 {
     pr->fds[pos].fd = fd;
+#ifdef WIN_FCNTL_NONBLOCK
+    // WSAPoll rejects POLLHUP as an input event with WSAEINVAL; it is
+    // delivered in revents only. POLLOUT is required when watching for the
+    // remote end closing on a socket since WSAPoll surfaces that there.
+    pr->fds[pos].events = write_only ? POLLOUT : POLLIN;
+#else
     pr->fds[pos].events = POLLHUP | (write_only ? 0 : POLLIN);
+#endif
     pr->fds[pos].revents = 0;
     pr->fd_callbacks[pos] = callback;
 }
@@ -142,6 +167,19 @@ pollreactor_run(struct pollreactor *pr)
                 if (pr->fds[i].revents)
                     pr->fd_callbacks[i](pr->callback_data, eventtime);
         } else if (ret < 0) {
+#ifdef WIN_FCNTL_NONBLOCK
+            int wsa_err = WSAGetLastError();
+            char buf[128];
+            int i;
+            int len = snprintf(buf, sizeof(buf), "poll WSA=%d nfds=%d fds=[",
+                               wsa_err, pr->num_fds);
+            for (i = 0; i < pr->num_fds && len < (int)sizeof(buf) - 8; i++)
+                len += snprintf(buf + len, sizeof(buf) - len, "%lld%s",
+                                (long long)pr->fds[i].fd,
+                                i + 1 < pr->num_fds ? "," : "");
+            snprintf(buf + len, sizeof(buf) - len, "]");
+            errorf("%s", buf);
+#endif
             report_errno("poll", ret);
             pr->must_exit = 1;
         }
@@ -165,6 +203,9 @@ pollreactor_is_exit(struct pollreactor *pr)
 int
 fd_set_non_blocking(int fd)
 {
+#ifdef WIN_FCNTL_NONBLOCK
+    return klipper_set_nonblock(fd);
+#else
     int flags = fcntl(fd, F_GETFL);
     if (flags < 0) {
         report_errno("fcntl getfl", flags);
@@ -176,4 +217,5 @@ fd_set_non_blocking(int fd)
         return -1;
     }
     return 0;
+#endif
 }
